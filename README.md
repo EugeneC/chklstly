@@ -1,6 +1,6 @@
 # Chklstly Service
 
-A Node.js service for managing Firebase user claims and AI suggestions.
+A Node.js service for managing Chklstly.
 
 ## Features
 
