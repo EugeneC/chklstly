@@ -1,4 +1,4 @@
-# Firebase User Claims Service
+# Chklstly Service
 
 A Node.js service for managing Firebase user claims and AI suggestions.
 
