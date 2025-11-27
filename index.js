@@ -1,40 +1,64 @@
 import express from 'express';
 import dotenv from 'dotenv';
-import admin from 'firebase-admin';
+import OpenAI from 'openai';
+import { createClient } from '@supabase/supabase-js';
 
 dotenv.config();
 
 const app = express();
 app.use(express.json());
 
-const serviceAccount = JSON.parse(
-  Buffer.from(process.env.GOOGLE_CREDENTIALS, 'base64').toString()
-);
 
-admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount),
+// Initialize OpenAI client for OpenRouter
+const openai = new OpenAI({
+  baseURL: "https://openrouter.ai/api/v1",
+  apiKey: process.env.OPENROUTER_API_KEY,
+  defaultHeaders: {
+    "HTTP-Referer": process.env.SITE_URL,
+    "X-Title": process.env.SITE_NAME,
+    "Content-Type": "application/json"
+  },
 });
 
-app.post('/trial', async (req, res) => {
-  const { idToken } = req.body;
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE_KEY
+);
 
-  if (!idToken) return res.status(400).json({ error: 'No idToken provided' });
+app.post('/trial', async (req, res) => {
+  const { accessToken } = req.body;
+
+  if (!accessToken) return res.status(400).json({ error: 'No accessToken provided' });
 
   try {
-    const decoded = await admin.auth().verifyIdToken(idToken);
-    if (decoded.trialExpireDate != null) {
+    const { data: { user }, error: authError } = await supabase.auth.getUser(accessToken);
+    if (authError || !user) {
+      console.error('Auth error:', authError);
+      return res.status(401).json({ error: 'Invalid token' });
+    }
+
+    const uid = user.id;
+    const metadata = user.app_metadata || {};
+
+    if (metadata.trialExpireDate != null) {
       return res.status(400).json({ error: 'Trial already set' });
     }
 
-    const uid = decoded.uid;
-    const userRecord = await admin.auth().getUser(uid);
-    const createdAtMs = new Date(userRecord.metadata.creationTime).getTime();
-    const trialExpireDate = createdAtMs + 7 * 24 * 60 * 60 * 1000;
+    const createdAtMs = new Date(user.created_at).getTime();
+    const trialExpireDate = createdAtMs + 7 * 24 * 60 * 60 * 1000; // +7 days
 
-    await admin.auth().setCustomUserClaims(uid, {
-        trialExpireDate: trialExpireDate,
-        hasPremium: decoded.hasPremium,
+    const { error: updateError } = await supabase.auth.admin.updateUserById(uid, {
+      app_metadata: {
+        ...metadata,
+        trialExpireDate,
+        hasPremium: metadata.hasPremium ?? false,
+      },
     });
+
+    if (updateError) {
+      console.error('Supabase update error:', updateError);
+      return res.status(500).json({ error: 'Failed to update trial data' });
+    }
 
     res.json({ success: true, trialExpireDate });
   } catch (err) {
@@ -44,23 +68,28 @@ app.post('/trial', async (req, res) => {
 });
 
 app.post('/premium', async (req, res) => {
-  const { idToken } = req.body;
-  if (!idToken) return res.status(400).json({ error: 'No idToken provided' });
+  const { accessToken } = req.body;
+  if (!accessToken) return res.status(400).json({ error: 'No accessToken provided' });
 
   try {
-    const decoded = await admin.auth().verifyIdToken(idToken);
-    if (decoded.hasPremium != null && decoded.hasPremium == true) {
-      return res.status(400).json({ error: 'Premium already set' });
+    const { data: { user }, error: authError } = await supabase.auth.getUser(accessToken);
+    if (authError || !user) {
+      return res.status(401).json({ error: 'Invalid token' });
     }
 
-    const uid = decoded.uid;
+    const uid = user.id;
+    const metadata = user.app_metadata || {};
+
+    if (metadata.hasPremium === true) {
+      return res.status(400).json({ error: 'Premium already set' });
+    }
 
     const adaptyResponse = await fetch(`https://api.adapty.io/api/v2/server-side-api/profile/`, {
       method: 'GET',
       headers: {
         'Authorization': `Api-Key ${process.env.ADAPTY_API_KEY}`,
         'Content-Type': 'application/json',
-        'adapty-customer-user-id': uid
+        'adapty-customer-user-id': uid,
       },
     });
 
@@ -71,13 +100,20 @@ app.post('/premium', async (req, res) => {
     }
 
     const adaptyData = await adaptyResponse.json();
-
     const hasPremium = hasActiveSubscription(adaptyData);
+
     if (hasPremium) {
-      await admin.auth().setCustomUserClaims(uid, {
-        trialExpireDate: decoded.trialExpireDate,
-        hasPremium: true,
+      const { error: updateError } = await supabase.auth.admin.updateUserById(uid, {
+        app_metadata: {
+          ...metadata,
+          hasPremium: true,
+          trialExpireDate: metadata.trialExpireDate ?? null,
+        },
       });
+
+      if (updateError) {
+        return res.status(500).json({ error: 'Failed to update premium status' });
+      }
     }
 
     res.json({ success: true, hasPremium });
@@ -87,42 +123,51 @@ app.post('/premium', async (req, res) => {
   }
 });
 
-app.put('/premium', async (req, res) => {
-  const { idToken } = req.body;
 
-  if (!idToken) return res.status(400).json({ error: 'No idToken provided' });
+app.put('/premium', async (req, res) => {
+  const { accessToken } = req.body;
+
+  if (!accessToken) return res.status(400).json({ error: 'No accessToken provided' });
 
   try {
-    const decoded = await admin.auth().verifyIdToken(idToken);
-    const uid = decoded.uid;
-
-    if (!decoded.hasPremium) {
-      return res.json({ skipped: true, reason: 'No hasPremium claim' });
+    const { data: { user }, error: authError } = await supabase.auth.getUser(accessToken);
+    if (authError || !user) {
+      console.error('Auth error:', authError);
+      return res.status(401).json({ error: 'Invalid token' });
     }
 
+    const uid = user.id;
+    const metadata = user.app_metadata || {};
+    const userEmail = user.email;
     const now = Date.now();
-    if (decoded.lastSubscriptionCheck && now - decoded.lastSubscriptionCheck < 24 * 60 * 60 * 1000) {
+
+    if (!metadata.hasPremium) {
+      return res.json({ skipped: true, reason: 'No hasPremium metadata' });
+    }
+
+    // Check in last 24hours
+    if (metadata.lastSubscriptionCheck && now - metadata.lastSubscriptionCheck < 24 * 60 * 60 * 1000) {
       return res.json({ skipped: true, reason: 'Checked less than 24h ago' });
     }
 
-    const userRecord = await admin.auth().getUser(uid);
-    const userEmail = userRecord.email;
-
+    // Skip e-mail
     const skipEmails = (process.env.SKIP_ADAPTY_EMAILS || '')
       .split(',')
       .map(e => e.trim().toLowerCase())
       .filter(Boolean);
 
     let hasPremium = false;
-    if (skipEmails.includes(userEmail.toLowerCase())) {
+
+    if (skipEmails.includes(userEmail?.toLowerCase())) {
       hasPremium = true;
     } else {
+      // Check status through Adapty
       const adaptyResponse = await fetch(`https://api.adapty.io/api/v2/server-side-api/profile/`, {
         method: 'GET',
         headers: {
           'Authorization': `Api-Key ${process.env.ADAPTY_API_KEY}`,
           'Content-Type': 'application/json',
-          'adapty-customer-user-id': uid
+          'adapty-customer-user-id': uid,
         },
       });
 
@@ -130,27 +175,30 @@ app.put('/premium', async (req, res) => {
         hasPremium = false;
       } else {
         const adaptyData = await adaptyResponse.json();
-
         hasPremium = hasActiveSubscription(adaptyData);
       }
     }
-    
-    if (!hasPremium) {
-      await admin.auth().setCustomUserClaims(uid, {
-        trialExpireDate: decoded.trialExpireDate,
-      });
 
-      return res.json({ updated: true, hasPremium: false });
-    } else {
-      await admin.auth().setCustomUserClaims(uid, {
-        trialExpireDate: decoded.trialExpireDate,
-        hasPremium: hasPremium,
-        lastSubscriptionCheck: now
-      });
-      return res.json({ updated: true, hasPremium: true });
+    // Update app_metadata
+    const updatedMetadata = {
+      ...metadata,
+      trialExpireDate: metadata.trialExpireDate ?? null,
+      hasPremium: hasPremium,
+      lastSubscriptionCheck: now,
+    };
+
+    const { error: updateError } = await supabase.auth.admin.updateUserById(uid, {
+      app_metadata: updatedMetadata,
+    });
+
+    if (updateError) {
+      console.error('Supabase update error:', updateError);
+      return res.status(500).json({ error: 'Failed to update user metadata' });
     }
+
+    return res.json({ updated: true, hasPremium });
   } catch (err) {
-    console.error(err);
+    console.error('Server error:', err);
     res.status(500).json({ error: 'Failed to update premium status' });
   }
 });
@@ -177,10 +225,10 @@ function hasActiveSubscription(adaptyData) {
 }
 
 app.post('/notify', async (req, res) => {
-  const { idToken, checklistId, userUids, content } = req.body;
+  const { accessToken, checklistId, userUids, content } = req.body;
 
-  if (!idToken || !userUids || !content) {
-    return res.status(400).json({ error: 'Missing required fields: idToken, userUids or content.' });
+  if (!accessToken || !userUids || !content) {
+    return res.status(400).json({ error: 'Missing required fields: accessToken, userUids or content.' });
   }
 
   const { titles, messages } = content;
@@ -189,12 +237,19 @@ app.post('/notify', async (req, res) => {
   }
 
   try {
-    const decoded = await admin.auth().verifyIdToken(idToken);
-    const uid = decoded.uid;
+    const { data: { user }, error: authError } = await supabase.auth.getUser(accessToken);
+    if (authError || !user) {
+      console.error('Auth error:', authError);
+      return res.status(401).json({ error: 'Invalid token' });
+    }
+
+    const uid = user.id;
+    const metadata = user.app_metadata || {};
+
 
     const now = Date.now();
-    if (!decoded.hasPremium && (!decoded.trialExpireDate || now > decoded.trialExpireDate)) {
-      return res.status(500).json({ error: 'User has no permissions.' });
+    if (!metadata.hasPremium && (!metadata.trialExpireDate || now > metadata.trialExpireDate)) {
+      return res.status(403).json({ error: 'User has no permissions.' });
     }
 
     const payload = {
@@ -228,6 +283,162 @@ app.post('/notify', async (req, res) => {
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: 'Failed' });
+  }
+});
+
+app.post('/ai/suggestions', async (req, res) => {
+  const { idToken, title, items } = req.body;
+
+  if (!idToken || !title || !items) {
+    return res.status(400).json({ error: 'Missing required fields: idToken, title or items.' });
+  }
+
+  if (title.trim().length < 3) {
+    return res.status(400).json({ error: 'Title must be at least 3 characters long.' });
+  }
+
+  const validItems = Array.isArray(items)
+    ? items.filter(item => item && item.trim().length >= 2)
+    : [];
+
+  const hasItems = validItems.length > 0;
+  // Min two items for full context
+  const hasEnoughItems = validItems.length >= 2;
+
+  try {
+    // Verify the user's authentication token
+    const decoded = await admin.auth().verifyIdToken(idToken);
+    const uid = decoded.uid;
+
+    // Check if user has premium access or is within trial period
+    const now = Date.now();
+    if (!decoded.hasPremium && (!decoded.trialExpireDate || now > decoded.trialExpireDate)) {
+      return res.status(403).json({ error: 'User has no permissions for AI suggestions' });
+    }
+
+    // --- Prompt will be based on context ---
+    let maxSuggestions;
+    if (hasEnoughItems) {
+      maxSuggestions = 10;
+    } else {
+      maxSuggestions = 5;
+    }
+
+
+    // Build prompt for AI suggestions
+    const systemPrompt = 'You are a helpful AI assistant that provides intelligent suggestions for checklist management and productivity. Provide concise, actionable advice. Do not include hidden reasoning or <think> sections in your output. Return only a JSON array of suggested new items, without numbering or explanations.';
+    let userPrompt = 'You are given a checklist with a title';
+    if (hasItems) {
+      userPrompt = userPrompt +  ` and some existing items. Suggest up to ${maxSuggestions} additional useful and practical items that logically complement the existing list, avoiding duplicates. Each item should be 1 short sentence. Title: ${title}.\nExisting items: ${validItems.join(', ')}.`;
+    } else {
+      userPrompt = userPrompt +  `. Suggest up to ${maxSuggestions} of the most essential and common items that are typically included for this type of checklist. Each item should be 1 short sentence. Title: ${title}.`;
+    }
+
+    const completion = await openai.chat.completions.create({
+      user: uid,
+      model: process.env.OR_MODEL_NAME,
+      messages: [
+        {
+          "role": "system",
+          "content": systemPrompt
+        },
+        {
+          "role": "user",
+          "content": userPrompt
+        }
+      ],
+      temperature: 0.7,
+      reasoning: {
+        enabled: false,
+        exclude: true,
+      }
+    });
+
+    const rawSuggestions = completion.choices[0].message.content;
+
+    if (!rawSuggestions) {
+      return res.status(500).json({ error: 'Failed to generate AI suggestion' });
+    }
+
+    let suggestions = rawSuggestions.replace(/<think>[\s\S]*?<\/think>/g, "").trim();
+    suggestions = suggestions.replace(/```json/g, "").replace(/```/g, "").trim();
+
+    res.json({ 
+      success: true, 
+      suggestions
+    });
+
+  } catch (err) {
+    console.error('AI suggestions error:', err);
+
+    console.error(err.message);
+    res.status(500).json({ error: err.message || 'Failed to generate AI suggestions' });
+  }
+});
+
+app.post('/ai/parse', async (req, res) => {
+  const { idToken, prompt } = req.body;
+
+  if (!idToken || !prompt) {
+    return res.status(400).json({ error: 'Missing required fields: idToken or prompt.' });
+  }
+
+  try {
+    // Verify the user's authentication token
+    const decoded = await admin.auth().verifyIdToken(idToken);
+    const uid = decoded.uid;
+
+    // Check if user has premium access or is within trial period
+    const now = Date.now();
+    if (!decoded.hasPremium && (!decoded.trialExpireDate || now > decoded.trialExpireDate)) {
+      return res.status(403).json({ error: 'User has no permissions for AI suggestions' });
+    }
+
+
+    // Build prompt for AI suggestions
+    const systemPrompt = 'You are a helpful assistant that extracts structured data from text. Rules: - Always return JSON only, without numbering or explanations; - JSON must have two fields: "title": string, "items": array of strings; - The title should be short (2–6 words max); - Items should be clear, concise, without duplicates; - If no items are detected, return an empty array. Do not include hidden reasoning or <think> sections in your output. Return only a JSON in format: {"title": "...", "items": ["...", "...", "..."]}, without numbering or explanations.';
+    let userPrompt = `The user provides a single piece of transcribed text (from voice input) that includes both a checklist title and list items. Now process this input: ${prompt}`;
+
+
+    const completion = await openai.chat.completions.create({
+      user: uid,
+      model: process.env.OR_MODEL_NAME,
+      messages: [
+        {
+          "role": "system",
+          "content": systemPrompt
+        },
+        {
+          "role": "user",
+          "content": userPrompt
+        }
+      ],
+      temperature: 0.7,
+      reasoning: {
+        enabled: false,
+        exclude: true,
+      }
+    });
+
+    const rawSuggestions = completion.choices[0].message.content;
+    // const rawSuggestions = '{"title": "Список покупок", "items": ["хлеб", "молока", "яйца"]}';
+
+    if (!rawSuggestions) {
+      return res.status(500).json({ error: 'Failed to generate AI suggestion' });
+    }
+
+    let suggestions = rawSuggestions.replace(/<think>[\s\S]*?<\/think>/g, "").trim();
+    suggestions = suggestions.replace(/```json/g, "").replace(/```/g, "").trim();
+
+    res.json({ 
+      success: true, 
+      suggestions
+    });
+  } catch (err) {
+    console.error('AI suggestions error:', err);
+
+    console.error(err.message);
+    res.status(500).json({ error: err.message || 'Failed to generate AI suggestions' });
   }
 });
 
