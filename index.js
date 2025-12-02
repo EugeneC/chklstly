@@ -79,28 +79,34 @@ app.post('/premium', async (req, res) => {
 
     const uid = user.id;
     const metadata = user.app_metadata || {};
+    const userEmail = user.email;
 
     if (metadata.hasPremium === true) {
       return res.status(400).json({ error: 'Premium already set' });
     }
 
-    const adaptyResponse = await fetch(`https://api.adapty.io/api/v2/server-side-api/profile/`, {
-      method: 'GET',
-      headers: {
-        'Authorization': `Api-Key ${process.env.ADAPTY_API_KEY}`,
-        'Content-Type': 'application/json',
-        'adapty-customer-user-id': uid,
-      },
-    });
+    let hasPremium = false;
+    if (skipEmails.includes(userEmail?.toLowerCase())) {
+      hasPremium = true;
+    } else {
+      const adaptyResponse = await fetch(`https://api.adapty.io/api/v2/server-side-api/profile/`, {
+        method: 'GET',
+        headers: {
+          'Authorization': `Api-Key ${process.env.ADAPTY_API_KEY}`,
+          'Content-Type': 'application/json',
+          'adapty-customer-user-id': uid,
+        },
+      });
 
-    if (!adaptyResponse.ok) {
-      const errText = await adaptyResponse.text();
-      console.error('Adapty error:', errText);
-      return res.status(500).json({ error: 'Failed to fetch subscription from Adapty' });
+      if (!adaptyResponse.ok) {
+        const errText = await adaptyResponse.text();
+        console.error('Adapty error:', errText);
+        return res.status(500).json({ error: 'Failed to fetch subscription from Adapty' });
+      }
+
+      const adaptyData = await adaptyResponse.json();
+      hasPremium = hasActiveSubscription(adaptyData);
     }
-
-    const adaptyData = await adaptyResponse.json();
-    const hasPremium = hasActiveSubscription(adaptyData);
 
     if (hasPremium) {
       const { error: updateError } = await supabase.auth.admin.updateUserById(uid, {
@@ -245,7 +251,6 @@ app.post('/notify', async (req, res) => {
 
     const uid = user.id;
     const metadata = user.app_metadata || {};
-
 
     const now = Date.now();
     if (!metadata.hasPremium && (!metadata.trialExpireDate || now > metadata.trialExpireDate)) {
