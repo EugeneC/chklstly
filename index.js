@@ -33,7 +33,6 @@ app.post('/trial', async (req, res) => {
   try {
     const { data: { user }, error: authError } = await supabase.auth.getUser(accessToken);
     if (authError || !user) {
-      console.error('Auth error:', authError);
       return res.status(401).json({ error: 'Invalid token' });
     }
 
@@ -56,89 +55,23 @@ app.post('/trial', async (req, res) => {
     });
 
     if (updateError) {
-      console.error('Supabase update error:', updateError);
       return res.status(500).json({ error: 'Failed to update trial data' });
     }
 
     res.json({ success: true, trialExpireDate });
   } catch (err) {
-    console.error(err);
     res.status(500).json({ error: 'Failed to set trial' });
   }
 });
 
-app.post('/premium', async (req, res) => {
-  const { accessToken } = req.body;
-  if (!accessToken) return res.status(400).json({ error: 'No accessToken provided' });
-
-  try {
-    const { data: { user }, error: authError } = await supabase.auth.getUser(accessToken);
-    if (authError || !user) {
-      return res.status(401).json({ error: 'Invalid token' });
-    }
-
-    const uid = user.id;
-    const metadata = user.app_metadata || {};
-    const userEmail = user.email;
-
-    if (metadata.hasPremium === true) {
-      return res.status(400).json({ error: 'Premium already set' });
-    }
-
-    let hasPremium = false;
-    if (skipEmails.includes(userEmail?.toLowerCase())) {
-      hasPremium = true;
-    } else {
-      const adaptyResponse = await fetch(`https://api.adapty.io/api/v2/server-side-api/profile/`, {
-        method: 'GET',
-        headers: {
-          'Authorization': `Api-Key ${process.env.ADAPTY_API_KEY}`,
-          'Content-Type': 'application/json',
-          'adapty-customer-user-id': uid,
-        },
-      });
-
-      if (!adaptyResponse.ok) {
-        const errText = await adaptyResponse.text();
-        console.error('Adapty error:', errText);
-        return res.status(500).json({ error: 'Failed to fetch subscription from Adapty' });
-      }
-
-      const adaptyData = await adaptyResponse.json();
-      hasPremium = hasActiveSubscription(adaptyData);
-    }
-
-    if (hasPremium) {
-      const { error: updateError } = await supabase.auth.admin.updateUserById(uid, {
-        app_metadata: {
-          ...metadata,
-          hasPremium: true,
-          trialExpireDate: metadata.trialExpireDate ?? null,
-        },
-      });
-
-      if (updateError) {
-        return res.status(500).json({ error: 'Failed to update premium status' });
-      }
-    }
-
-    res.json({ success: true, hasPremium });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Failed to update premium status' });
-  }
-});
-
-
 app.put('/premium', async (req, res) => {
-  const { accessToken } = req.body;
+  const { accessToken, forceCheck = false } = req.body;
 
   if (!accessToken) return res.status(400).json({ error: 'No accessToken provided' });
 
   try {
     const { data: { user }, error: authError } = await supabase.auth.getUser(accessToken);
     if (authError || !user) {
-      console.error('Auth error:', authError);
       return res.status(401).json({ error: 'Invalid token' });
     }
 
@@ -147,12 +80,8 @@ app.put('/premium', async (req, res) => {
     const userEmail = user.email;
     const now = Date.now();
 
-    if (!metadata.hasPremium) {
-      return res.json({ skipped: true, reason: 'No hasPremium metadata' });
-    }
-
     // Check in last 24hours
-    if (metadata.lastSubscriptionCheck && now - metadata.lastSubscriptionCheck < 24 * 60 * 60 * 1000) {
+    if (!forceCheck && metadata.lastSubscriptionCheck && now - metadata.lastSubscriptionCheck < 24 * 60 * 60 * 1000) {
       return res.json({ skipped: true, reason: 'Checked less than 24h ago' });
     }
 
@@ -198,13 +127,11 @@ app.put('/premium', async (req, res) => {
     });
 
     if (updateError) {
-      console.error('Supabase update error:', updateError);
       return res.status(500).json({ error: 'Failed to update user metadata' });
     }
 
     return res.json({ updated: true, hasPremium });
   } catch (err) {
-    console.error('Server error:', err);
     res.status(500).json({ error: 'Failed to update premium status' });
   }
 });
@@ -245,7 +172,6 @@ app.post('/notify', async (req, res) => {
   try {
     const { data: { user }, error: authError } = await supabase.auth.getUser(accessToken);
     if (authError || !user) {
-      console.error('Auth error:', authError);
       return res.status(401).json({ error: 'Invalid token' });
     }
 
@@ -286,7 +212,6 @@ app.post('/notify', async (req, res) => {
 
     res.json(await r.json());
   } catch (e) {
-    console.error(e);
     res.status(500).json({ error: 'Failed' });
   }
 });
